@@ -5,6 +5,22 @@ import pandas as pd
 st.set_page_config(page_title="My Stock Tool", layout="centered")
 st.title("📈 My Stock Tool")
 
+try:
+    APP_PASSWORD = st.secrets["APP_PASSWORD"]
+except Exception:
+    st.error("APP_PASSWORD is not set in Secrets.")
+    st.stop()
+
+if not st.session_state.get("authed"):
+    pw = st.text_input("Password", type="password")
+    if pw:
+        if pw == APP_PASSWORD:
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            st.error("Wrong password")
+    st.stop()
+
 symbol = st.text_input("NSE stock symbol", "RELIANCE").strip().upper()
 ticker = symbol if symbol.endswith(".NS") else symbol + ".NS"
 use_ai = st.checkbox("AI news summary (needs Claude API key)")
