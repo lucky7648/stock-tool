@@ -83,7 +83,8 @@ with tab_a:
 @st.cache_data(ttl=300)
 def get_hist(ticker, period, interval):
     try:
-        return yf.Ticker(ticker).history(period=period, interval=interval)
+        h = yf.Ticker(ticker).history(period=period, interval=interval)
+        return h.dropna(subset=["Close"]) if not h.empty else h
     except Exception:
         return pd.DataFrame()
 
@@ -368,8 +369,11 @@ def get_analysis(sym):
 
 
 def size_position(entry, stop, cap, rpct):
+    vals = (entry, stop, cap, rpct)
+    if not all(isnum(x) and abs(x) != float("inf") for x in vals):
+        return 0, 0.0, 0.0
     rps = entry - stop
-    if rps <= 0:
+    if rps <= 0 or entry <= 0:
         return 0, 0.0, 0.0
     qty = int((cap * rpct / 100) // rps)
     qty = min(qty, int(cap // entry))
@@ -762,7 +766,7 @@ def scan_universe(symbols):
     rows = []
     for s in symbols:
         try:
-            d = raw[s + ".NS"].dropna(how="all")
+            d = raw[s + ".NS"].dropna(subset=["Close"])
             c = d["Close"].dropna()
             if len(c) < 60:
                 continue
