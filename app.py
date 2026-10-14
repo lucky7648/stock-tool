@@ -229,7 +229,10 @@ if go:
         show_stock(symbol)
     else:
         try:
-            show_futures(symbol) if mode == "Futures" else show_options(symbol)
+            if mode == "Futures":
+                show_futures(symbol)
+            else:
+                show_options(symbol)
         except Exception as e:
             st.error("Could not fetch NSE derivatives data. NSE often blocks "
                      "cloud servers. A broker API is the reliable fix.")
