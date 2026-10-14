@@ -153,76 +153,131 @@ def show_stock(sym):
             st.warning(f"AI summary failed: {e}")
 
 
-# ---------- NSE derivatives (futures / options) ----------
-HDR = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)",
-       "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9"}
+# ---------- Angel One (futures / options) ----------
+SCRIP_URL = ("https://margincalculator.angelbroking.com/OpenAPI_File/files/"
+             "OpenAPIScripMaster.json")
 
 
-def nse_json(url):
-    s = requests.Session()
-    s.get("https://www.nseindia.com", headers=HDR, timeout=10)
-    r = s.get(url, headers=HDR, timeout=10)
-    r.raise_for_status()
-    return r.json()
+@st.cache_resource(ttl=6 * 3600)
+def angel_login():
+    import pyotp
+    from SmartApi import SmartConnect
+    obj = SmartConnect(api_key=st.secrets["ANGEL_API_KEY"])
+    totp = pyotp.TOTP(st.secrets["ANGEL_TOTP_SECRET"]).now()
+    data = obj.generateSession(st.secrets["ANGEL_CLIENT_ID"],
+                               st.secrets["ANGEL_PIN"], totp)
+    if not data.get("status"):
+        raise RuntimeError(f"Angel One login failed: {data.get('message')}")
+    return obj
+
+
+@st.cache_data(ttl=43200, show_spinner="Loading F&O contracts...")
+def load_fno():
+    rows = requests.get(SCRIP_URL, timeout=90).json()
+    df = pd.DataFrame(rows)
+    df = df[(df["exch_seg"] == "NFO") &
+            (df["instrumenttype"].isin(["FUTSTK", "OPTSTK"]))].copy()
+    df["strike"] = df["strike"].astype(float) / 100
+    df["lotsize"] = df["lotsize"].astype(int)
+    df["exp"] = pd.to_datetime(df["expiry"], format="%d%b%Y")
+    df = df[df["exp"] >= pd.Timestamp.today().normalize()]
+    return df[["token", "symbol", "name", "exp", "expiry", "strike",
+               "lotsize", "instrumenttype"]]
+
+
+@st.cache_data(ttl=15)
+def get_quotes(tokens):
+    for attempt in range(2):
+        try:
+            res = angel_login().getMarketData("FULL", {"NFO": list(tokens)})
+            if res.get("status"):
+                return {d["symbolToken"]: d for d in res["data"]["fetched"]}
+            raise RuntimeError(res.get("message", "unknown error"))
+        except Exception:
+            if attempt == 1:
+                raise
+            angel_login.clear()
+
+
+def spot_price(sym):
+    h = yf.Ticker(sym + ".NS").history(period="5d")
+    return float(h["Close"].iloc[-1]) if not h.empty else None
 
 
 def show_futures(sym):
-    data = nse_json(f"https://www.nseindia.com/api/quote-derivative?symbol={sym}")
-    rows = []
-    for item in data.get("stocks", []):
-        m = item.get("metadata", {})
-        if m.get("instrumentType") == "Stock Futures":
-            rows.append({"Expiry": m.get("expiryDate"),
-                         "LTP": m.get("lastPrice"),
-                         "Change %": m.get("pChange"),
-                         "Open": m.get("openPrice"),
-                         "High": m.get("highPrice"),
-                         "Low": m.get("lowPrice")})
-    if not rows:
-        st.warning("No futures data found (this stock may not have F&O).")
+    fno = load_fno()
+    f = fno[(fno["name"] == sym) & (fno["instrumenttype"] == "FUTSTK")]
+    f = f.sort_values("exp")
+    if f.empty:
+        st.warning("No futures found (this stock may not have F&O).")
         return
-    st.subheader(f"{sym} Futures")
+    q = get_quotes(tuple(f["token"]))
+    spot = spot_price(sym)
+    rows = []
+    for _, r in f.iterrows():
+        d = q.get(r["token"], {})
+        ltp = d.get("ltp")
+        rows.append({"Expiry": r["expiry"], "LTP": ltp,
+                     "Chg %": d.get("percentChange"),
+                     "OI": d.get("opnInterest"),
+                     "Volume": d.get("tradeVolume"),
+                     "Lot": r["lotsize"],
+                     "Vs spot": round(ltp - spot, 2) if ltp and spot else None})
+    st.subheader(f"{sym} Futures" + (f"  (spot ₹{spot:.2f})" if spot else ""))
     st.dataframe(pd.DataFrame(rows), hide_index=True)
+    st.caption("Price up + OI up = long buildup. Price down + OI up = short "
+               "buildup. Compare OI with the previous day.")
 
 
 def show_options(sym):
-    data = nse_json(f"https://www.nseindia.com/api/option-chain-equities?symbol={sym}")
-    rec = data.get("records", {})
-    expiries = rec.get("expiryDates", [])
-    spot = rec.get("underlyingValue")
-    if not expiries:
-        st.warning("No options data found (this stock may not have F&O).")
+    fno = load_fno()
+    o = fno[(fno["name"] == sym) & (fno["instrumenttype"] == "OPTSTK")]
+    if o.empty:
+        st.warning("No options found (this stock may not have F&O).")
         return
+    expiries = sorted(o["expiry"].unique(),
+                      key=lambda e: pd.to_datetime(e, format="%d%b%Y"))
     expiry = st.selectbox("Expiry", expiries)
-    rows = []
-    for d in rec.get("data", []):
-        if d.get("expiryDate") != expiry:
-            continue
-        ce, pe = d.get("CE", {}), d.get("PE", {})
-        rows.append({"Strike": d["strikePrice"],
-                     "CE OI": ce.get("openInterest", 0),
-                     "CE ΔOI": ce.get("changeinOpenInterest", 0),
-                     "CE LTP": ce.get("lastPrice", 0),
-                     "PE LTP": pe.get("lastPrice", 0),
-                     "PE ΔOI": pe.get("changeinOpenInterest", 0),
-                     "PE OI": pe.get("openInterest", 0)})
-    df = pd.DataFrame(rows).sort_values("Strike")
-    st.subheader(f"{sym} Options  (spot ₹{spot})")
-    pcr = df["PE OI"].sum() / max(df["CE OI"].sum(), 1)
-    res = df.loc[df["CE OI"].idxmax(), "Strike"]
-    sup = df.loc[df["PE OI"].idxmax(), "Strike"]
-    st.write(f"PCR (put/call OI): **{pcr:.2f}** "
-             f"({'bullish bias' if pcr > 1.2 else 'bearish bias' if pcr < 0.7 else 'neutral'})")
-    st.write(f"Resistance (max call OI): **{res}** | Support (max put OI): **{sup}**")
+    o = o[o["expiry"] == expiry]
+    spot = spot_price(sym)
+    strikes = sorted(o["strike"].unique())
     if spot:
-        atm = (df["Strike"] - spot).abs().idxmin()
-        pos = df.index.get_loc(atm)
-        df = df.iloc[max(pos - 6, 0): pos + 7]
+        i = min(range(len(strikes)), key=lambda k: abs(strikes[k] - spot))
+    else:
+        i = len(strikes) // 2
+    window = strikes[max(i - 10, 0): i + 11]
+    o = o[o["strike"].isin(window)]
+    q = get_quotes(tuple(o["token"]))
+
+    rows = []
+    for k in window:
+        row = {"Strike": k}
+        for side in ("CE", "PE"):
+            m = o[(o["strike"] == k) & (o["symbol"].str.endswith(side))]
+            d = q.get(m["token"].iloc[0], {}) if not m.empty else {}
+            row[f"{side} LTP"] = d.get("ltp")
+            row[f"{side} OI"] = d.get("opnInterest")
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    ce = df["CE OI"].fillna(0)
+    pe = df["PE OI"].fillna(0)
+
+    st.subheader(f"{sym} Options" + (f"  (spot ₹{spot:.2f})" if spot else ""))
+    st.write(f"Lot size: **{int(o['lotsize'].iloc[0])}**")
+    pcr = pe.sum() / max(ce.sum(), 1)
+    st.write(f"PCR (near spot): **{pcr:.2f}** "
+             f"({'bullish bias' if pcr > 1.2 else 'bearish bias' if pcr < 0.7 else 'neutral'})")
+    st.write(f"Resistance (max call OI): **{df.loc[ce.idxmax(), 'Strike']}** | "
+             f"Support (max put OI): **{df.loc[pe.idxmax(), 'Strike']}**")
     st.dataframe(df, hide_index=True)
+    st.caption("Shows 10 strikes above and below the spot price.")
 
 
 # ---------- Run ----------
 if go:
+    st.session_state["run"] = True
+
+if st.session_state.get("run"):
     if not symbol:
         st.warning("Select a stock first.")
     elif mode == "Stock":
@@ -234,7 +289,6 @@ if go:
             else:
                 show_options(symbol)
         except Exception as e:
-            st.error("Could not fetch NSE derivatives data. NSE often blocks "
-                     "cloud servers. A broker API is the reliable fix.")
+            st.error("Could not fetch Angel One data.")
             st.caption(f"Details: {e}")
     st.caption("Educational tool only, not financial advice.")
