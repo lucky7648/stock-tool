@@ -56,23 +56,27 @@ def load_symbols():
 
 
 labels = load_symbols()
-symbol = st.selectbox(
-    "Stock (type 2-3 letters)", options=list(labels.keys()),
-    format_func=lambda s: labels[s], index=None,
-    placeholder="e.g. REL, TCS, HDFC")
-company = labels[symbol].split(" - ", 1)[-1] if symbol else ""
+tab_a, tab_m, tab_i = st.tabs(["🔍 Analyse", "🔥 Movers", "💡 Ideas"])
 
-mode = st.radio("What do you want to see?", ["Stock", "Futures", "Options"],
-                horizontal=True)
+with tab_a:
+    symbol = st.selectbox(
+        "Stock (type 2-3 letters)", options=list(labels.keys()),
+        format_func=lambda s: labels[s], index=None,
+        placeholder="e.g. REL, TCS, HDFC", key="symbol_sel")
+    st.caption("Tip: you can also type part of a company name, like tata, bank or pharma.")
+    company = labels[symbol].split(" - ", 1)[-1] if symbol else ""
 
-with st.expander("⚙️ My capital and risk"):
-    capital = st.number_input("Trading capital (₹)", min_value=10000,
-                              value=100000, step=10000)
-    risk_pct = st.slider("Max loss per trade (% of capital)", 0.5, 3.0, 1.0, 0.5)
-    st.caption("Rule: never risk more than 1-2% of your capital on one trade.")
+    mode = st.radio("What do you want to see?", ["Stock", "Futures", "Options"],
+                    horizontal=True, key="mode_sel")
 
-use_ai = st.checkbox("AI news summary (needs Claude API key)")
-go = st.button("Analyse", type="primary")
+    with st.expander("⚙️ My capital and risk"):
+        capital = st.number_input("Trading capital (₹)", min_value=10000,
+                                  value=100000, step=10000)
+        risk_pct = st.slider("Max loss per trade (% of capital)", 0.5, 3.0, 1.0, 0.5)
+        st.caption("Rule: never risk more than 1-2% of your capital on one trade.")
+
+    use_ai = st.checkbox("AI news summary (needs Claude API key)")
+    go = st.button("Analyse", type="primary")
 
 
 # ---------- Data helpers ----------
@@ -84,15 +88,62 @@ def get_hist(ticker, period, interval):
         return pd.DataFrame()
 
 
+INFO_KEYS = ["trailingPE", "returnOnEquity", "debtToEquity", "earningsGrowth",
+             "marketCap", "sector", "profitMargins"]
+
+
+def screener_data(sym):
+    out = {}
+    hdr = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"}
+    for path in ("consolidated/", ""):
+        try:
+            r = requests.get(f"https://www.screener.in/company/{quote_plus(sym)}/{path}",
+                             headers=hdr, timeout=10)
+        except Exception:
+            continue
+        if r.status_code != 200:
+            continue
+        pairs = re.findall(r'<span class="name">\s*(.*?)\s*</span>\s*'
+                           r'<span class="nowrap value">(.*?)</li>', r.text, re.S)
+        for name, val in pairs:
+            m = re.search(r'class="number">\s*([-\d,\.]+)', val)
+            if not m:
+                continue
+            try:
+                num = float(m.group(1).replace(",", ""))
+            except ValueError:
+                continue
+            name = re.sub(r"<.*?>|\s+", " ", name).strip()
+            if name == "Stock P/E":
+                out["trailingPE"] = num
+            elif name == "ROE":
+                out["returnOnEquity"] = num / 100
+            elif name == "Market Cap":
+                out["marketCap"] = num * 1e7
+        if out:
+            break
+    return out
+
+
 @st.cache_data(ttl=3600)
 def get_info(sym):
+    out = {k: None for k in INFO_KEYS}
+    src = "none"
     try:
         i = yf.Ticker(sym + ".NS").info or {}
+        for k in INFO_KEYS:
+            out[k] = i.get(k)
+        if any(isnum(out[k]) for k in ("trailingPE", "returnOnEquity", "earningsGrowth")):
+            src = "Yahoo Finance"
     except Exception:
-        i = {}
-    keys = ["trailingPE", "returnOnEquity", "debtToEquity", "earningsGrowth",
-            "marketCap", "sector", "profitMargins"]
-    return {k: i.get(k) for k in keys}
+        pass
+    if src == "none":
+        sc = screener_data(sym)
+        if sc:
+            out.update(sc)
+            src = "Screener.in"
+    out["source"] = src
+    return out
 
 
 def market_up():
@@ -406,6 +457,8 @@ def show_stock(sym, name):
     box = {"BUY": st.success, "WAIT": st.warning, "AVOID": st.error}[v["verdict"]]
     box(f"### Verdict: {v['verdict']}  ({v['score']}/100)\n{v['advice']}")
     render_checks(v)
+    if v["groups"]["Fundamentals"][1] == 0:
+        st.caption("Fundamentals were not available, so this score uses technicals and risk-reward only.")
 
     st.subheader("Trade plan (if you buy)")
     plan = pd.DataFrame({
@@ -429,17 +482,41 @@ def show_stock(sym, name):
         st.warning("News tone is negative. Read the headlines before you buy.")
     if use_ai and news:
         try:
-            st.info(ai_summary(sym, tuple(n["title"] for n in news)))
-        except Exception as e:
-            st.warning(f"AI summary failed: {e}")
+            has_key = "ANTHROPIC_API_KEY" in st.secrets
+        except Exception:
+            has_key = False
+        if not has_key:
+            st.info("AI summary needs a Claude API key, which is not added yet. "
+                    "Everything else works without it.")
+        else:
+            try:
+                st.info(ai_summary(sym, tuple(n["title"] for n in news)))
+            except Exception as e:
+                st.warning(f"AI summary failed: {e}")
 
     with st.expander("Fundamental numbers"):
-        for label, key in {"PE": "trailingPE", "ROE": "returnOnEquity",
-                           "Debt/Equity": "debtToEquity",
-                           "Earnings growth": "earningsGrowth",
-                           "Profit margin": "profitMargins",
-                           "Market cap": "marketCap"}.items():
-            st.write(f"{label}: **{info.get(key, 'N/A')}**")
+        if info.get("source") == "none":
+            st.info("Fundamental data is not available right now (Yahoo sometimes "
+                    "blocks cloud servers). The verdict uses technicals and "
+                    "risk-reward only.")
+        else:
+            st.caption(f"Source: {info['source']}")
+
+        def fmt(x, kind):
+            if not isnum(x):
+                return "N/A"
+            if kind == "pct":
+                return f"{x * 100:.1f}%"
+            if kind == "cr":
+                return f"₹{x / 1e7:,.0f} Cr"
+            return f"{x:.1f}"
+
+        for label, key, kind in [("PE", "trailingPE", "num"), ("ROE", "returnOnEquity", "pct"),
+                                 ("Debt/Equity", "debtToEquity", "num"),
+                                 ("Earnings growth", "earningsGrowth", "pct"),
+                                 ("Profit margin", "profitMargins", "pct"),
+                                 ("Market cap", "marketCap", "cr")]:
+            st.write(f"{label}: **{fmt(info.get(key), kind)}**")
     render_glossary()
 
 
@@ -649,23 +726,159 @@ def show_options(sym):
     st.caption("Option buying can lose 100% of the premium. Decide your exit before entering.")
 
 
-# ---------- Run ----------
-if go:
+# ---------- Market scanner (movers and ideas) ----------
+SECTORS = {
+    "Banks": "HDFCBANK ICICIBANK SBIN KOTAKBANK AXISBANK INDUSINDBK BANKBARODA PNB CANBK FEDERALBNK IDFCFIRSTB AUBANK",
+    "IT": "TCS INFY HCLTECH WIPRO TECHM PERSISTENT COFORGE MPHASIS",
+    "Pharma": "SUNPHARMA DRREDDY CIPLA DIVISLAB LUPIN AUROPHARMA TORNTPHARM ZYDUSLIFE ALKEM",
+    "Auto": "MARUTI M&M BAJAJ-AUTO EICHERMOT HEROMOTOCO TVSMOTOR ASHOKLEY BOSCHLTD",
+    "FMCG": "HINDUNILVR ITC NESTLEIND BRITANNIA DABUR GODREJCP MARICO COLPAL TATACONSUM",
+    "Oil, Gas and Power": "RELIANCE ONGC IOC BPCL GAIL NTPC POWERGRID TATAPOWER COALINDIA",
+    "Metals": "TATASTEEL JSWSTEEL HINDALCO VEDL JINDALSTEL SAIL NMDC",
+    "Finance": "BAJFINANCE BAJAJFINSV SHRIRAMFIN CHOLAFIN MUTHOOTFIN PFC RECLTD SBILIFE HDFCLIFE",
+    "Infra and Capital goods": "LT ADANIPORTS SIEMENS ABB HAL BEL DLF",
+}
+UNIVERSES = ["Nifty 50", "All F&O stocks"]
+
+
+def valid_syms(names):
+    if len(labels) > 500:
+        return tuple(s for s in names if s in labels)
+    return tuple(names)
+
+
+def universe_symbols(choice):
+    if choice == "Nifty 50":
+        return valid_syms(NIFTY50)
+    return valid_syms(sorted(load_fno()["name"].unique()))
+
+
+@st.cache_data(ttl=600, show_spinner="Loading prices (first time takes a little while)...")
+def scan_universe(symbols):
+    tickers = [s + ".NS" for s in symbols]
+    raw = yf.download(tickers, period="1y", interval="1d", group_by="ticker",
+                      threads=True, progress=False)
+    mkt = market_up()
+    rows = []
+    for s in symbols:
+        try:
+            d = raw[s + ".NS"].dropna(how="all")
+            c = d["Close"].dropna()
+            if len(c) < 60:
+                continue
+            chg = (c.iloc[-1] / c.iloc[-2] - 1) * 100
+            v = verdict_engine(add_indicators(d), {}, mkt)
+            rows.append({"Symbol": s,
+                         "Company": labels.get(s, s).split(" - ", 1)[-1][:28],
+                         "Price": round(float(c.iloc[-1]), 2),
+                         "Chg %": round(float(chg), 2),
+                         "Score": int(v["score"]), "Verdict": v["verdict"],
+                         "R:R": round(float(v["rr"]), 1)})
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+
+def open_in_analysis(sym):
+    if sym not in labels:
+        return
+    st.session_state["symbol_sel"] = sym
+    st.session_state["mode_sel"] = "Stock"
     st.session_state["run"] = True
 
-if st.session_state.get("run"):
-    if not symbol:
-        st.warning("Select a stock first.")
-    elif mode == "Stock":
-        show_stock(symbol, company)
-    else:
+
+def pick_and_open(df, key):
+    sym = st.selectbox("Open one in the Analyse tab", df["Symbol"].tolist(), index=None,
+                       key=key, placeholder="Pick a stock",
+                       format_func=lambda s: labels.get(s, s))
+    if sym:
+        st.button(f"Analyse {sym}", key=key + "_btn", on_click=open_in_analysis, args=(sym,))
+        st.caption("After tapping, switch to the Analyse tab.")
+
+
+# ---------- Run ----------
+with tab_a:
+    if go:
+        st.session_state["run"] = True
+
+    if st.session_state.get("run"):
+        if not symbol:
+            st.warning("Select a stock first.")
+        elif mode == "Stock":
+            show_stock(symbol, company)
+        else:
+            try:
+                if mode == "Futures":
+                    show_futures(symbol)
+                else:
+                    show_options(symbol)
+            except Exception as e:
+                st.error("Could not fetch Angel One data.")
+                st.caption(f"Details: {e}")
+        st.caption("Educational tool only, not financial advice. Rules are simple and "
+                   "not backtested. Paper-trade first.")
+
+with tab_m:
+    st.caption("Biggest movers of the day. Prices come from Yahoo and can be slightly delayed.")
+    uni_m = st.radio("Stocks to scan", UNIVERSES, horizontal=True, key="uni_m")
+    if st.button("Show top gainers and losers"):
+        st.session_state["movers"] = True
+    if st.session_state.get("movers"):
         try:
-            if mode == "Futures":
-                show_futures(symbol)
+            tbl = scan_universe(universe_symbols(uni_m))
+            if tbl.empty:
+                st.warning("Could not load prices right now. Try again in a minute.")
             else:
-                show_options(symbol)
+                tbl = tbl.sort_values("Chg %", ascending=False)
+                st.subheader("🟢 Top gainers")
+                st.dataframe(tbl.head(10), hide_index=True)
+                st.subheader("🔴 Top losers")
+                st.dataframe(tbl.tail(10).iloc[::-1], hide_index=True)
+                st.caption("A stock that jumped a lot today is not automatically a buy. "
+                           "Open it in Analyse and check the verdict and risk-reward first.")
+                pick_and_open(pd.concat([tbl.head(10), tbl.tail(10)]), "pick_m")
         except Exception as e:
-            st.error("Could not fetch Angel One data.")
+            st.error("Could not load market data.")
             st.caption(f"Details: {e}")
-    st.caption("Educational tool only, not financial advice. Rules are simple and "
-               "not backtested. Paper-trade first.")
+
+with tab_i:
+    st.subheader("Best setups today")
+    st.caption("Quick scan of many stocks using technicals and risk-reward only. "
+               "Fundamentals are checked when you open a stock in Analyse.")
+    uni_i = st.radio("Stocks to scan", UNIVERSES, horizontal=True, key="uni_i")
+    if st.button("Scan for setups"):
+        st.session_state["scan"] = True
+    if st.session_state.get("scan"):
+        try:
+            tbl = scan_universe(universe_symbols(uni_i))
+            if tbl.empty:
+                st.warning("Could not load prices right now. Try again in a minute.")
+            else:
+                buys = tbl[tbl["Verdict"] == "BUY"].sort_values("Score", ascending=False)
+                waits = tbl[tbl["Verdict"] == "WAIT"].sort_values("Score", ascending=False)
+                if buys.empty:
+                    st.info("No stock passes all BUY rules today. Waiting is also a good decision.")
+                else:
+                    st.success(f"{len(buys)} stock(s) pass the BUY rules")
+                    st.dataframe(buys.head(15), hide_index=True)
+                st.write("Close to a setup (WAIT list):")
+                st.dataframe(waits.head(10), hide_index=True)
+                pick_and_open(pd.concat([buys.head(15), waits.head(10)]), "pick_i")
+        except Exception as e:
+            st.error("Could not scan the market.")
+            st.caption(f"Details: {e}")
+
+    st.subheader("Browse by sector")
+    sector = st.selectbox("Sector", list(SECTORS), index=None, placeholder="Choose a sector",
+                          key="sector_sel")
+    if sector:
+        try:
+            tbl = scan_universe(valid_syms(SECTORS[sector].split()))
+            if tbl.empty:
+                st.warning("Could not load prices right now.")
+            else:
+                st.dataframe(tbl.sort_values("Score", ascending=False), hide_index=True)
+                pick_and_open(tbl, "pick_s")
+        except Exception as e:
+            st.error("Could not load this sector.")
+            st.caption(f"Details: {e}")
