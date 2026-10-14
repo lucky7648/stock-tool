@@ -5,3 +5,6 @@ requests
 anthropic
 smartapi-python
 pyotp
+logzero
+websocket-client
+pycryptodome
