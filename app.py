@@ -1,4 +1,5 @@
 import io
+import json
 import re
 import xml.etree.ElementTree as ET
 from urllib.parse import quote_plus
@@ -56,7 +57,7 @@ def load_symbols():
 
 
 labels = load_symbols()
-tab_a, tab_m, tab_i = st.tabs(["🔍 Analyse", "🔥 Movers", "💡 Ideas"])
+tab_a, tab_m, tab_i, tab_p = st.tabs(["🔍 Analyse", "🔥 Movers", "💡 Ideas", "📒 Paper"])
 
 with tab_a:
     symbol = st.selectbox(
@@ -478,6 +479,7 @@ def show_stock(sym, name):
                  f"If the target hits you gain about **₹{qty * (v['target'] - v['entry']):,.0f}**.")
     else:
         st.warning("Even 1 share is too expensive or too risky for your capital and risk limit.")
+    paper_stock_ticket(sym, v, qty)
 
     draw_chart(sym, df)
 
@@ -595,11 +597,17 @@ def show_futures(sym):
                      "OI": d.get("opnInterest"),
                      "Volume": d.get("tradeVolume"),
                      "Lot": r["lotsize"],
-                     "Vs spot": round(ltp - spot, 2) if ltp and spot else None})
-    st.subheader(f"{sym} Futures" + (f"  (spot ₹{spot:.2f})" if spot else ""))
+                     "Premium vs spot ₹": round(ltp - spot, 2) if ltp and spot else None,
+                     "Premium %": round((ltp - spot) / spot * 100, 2) if ltp and spot else None})
+    st.subheader(f"{sym} Futures")
+    if spot and rows[0]["LTP"]:
+        diff = rows[0]["LTP"] - spot
+        st.write(f"Spot price: **₹{spot:.2f}** | Near-month futures: **₹{rows[0]['LTP']:.2f}** | "
+                 f"Premium over spot: **₹{diff:+.2f}** ({diff / spot * 100:+.2f}%)")
     st.dataframe(pd.DataFrame(rows), hide_index=True)
-    st.caption("Price up + OI up = long buildup. Price down + OI up = short "
-               "buildup. Compare OI with the previous day.")
+    st.caption("Futures premium = futures price minus spot price (a minus sign means a discount). "
+               "You do not pay a premium for futures, you only block margin. "
+               "Price up + OI up = long buildup. Price down + OI up = short buildup.")
     if not res:
         return
     v = res[2]
@@ -631,6 +639,8 @@ def show_futures(sym):
         st.warning(f"One lot risks about ₹{risk_lot:,.0f}, more than your limit of "
                    f"₹{capital * risk_pct / 100:,.0f}. This is too big for your capital. "
                    "Skip it, or look at options (loss is limited to the premium).")
+    paper_fut_ticket(sym, near["Expiry"], str(f.iloc[0]["token"]), long_side, lot,
+                     entry, stop, target)
 
 
 def show_options(sym):
@@ -669,7 +679,17 @@ def show_options(sym):
     lot = int(o["lotsize"].iloc[0])
     days_left = (pd.to_datetime(expiry, format="%d%b%Y") - pd.Timestamp.today().normalize()).days
 
-    st.subheader(f"{sym} Options" + (f"  (spot ₹{spot:.2f})" if spot else ""))
+    st.subheader(f"{sym} Options")
+    atm_ce = df.loc[df["Strike"] == atm, "CE LTP"].iloc[0]
+    atm_pe = df.loc[df["Strike"] == atm, "PE LTP"].iloc[0]
+    if spot:
+        st.write(f"Spot price: **₹{spot:.2f}** | Nearest (ATM) strike: **{atm:g}**")
+    if isnum(atm_ce) and isnum(atm_pe):
+        st.write(f"ATM premium: **CE ₹{atm_ce:.2f}** | **PE ₹{atm_pe:.2f}** | "
+                 f"1 lot costs about **₹{atm_ce * lot:,.0f}** (CE) / **₹{atm_pe * lot:,.0f}** (PE)")
+        if spot:
+            st.caption(f"CE + PE together = ₹{atm_ce + atm_pe:.2f}. The market is roughly "
+                       f"expecting a move of about ±{(atm_ce + atm_pe) / spot * 100:.1f}% by expiry.")
     pcr = pe.sum() / max(ce.sum(), 1)
     support = df.loc[pe.idxmax(), "Strike"]
     resistance = df.loc[ce.idxmax(), "Strike"]
@@ -677,7 +697,9 @@ def show_options(sym):
     st.write(f"PCR (near spot): **{pcr:.2f}** "
              f"({'bullish lean' if pcr > 1.2 else 'bearish lean' if pcr < 0.7 else 'neutral'})")
     st.write(f"Resistance (max call OI): **{resistance}** | Support (max put OI): **{support}**")
-    st.dataframe(df, hide_index=True)
+    st.dataframe(df, hide_index=True, column_config={
+        "CE LTP": st.column_config.NumberColumn("CE premium ₹"),
+        "PE LTP": st.column_config.NumberColumn("PE premium ₹")})
 
     if not res:
         return
@@ -727,6 +749,10 @@ def show_options(sym):
         st.warning("One lot costs more than your risk limit allows even with an exit at -35%. Skip it.")
     if move is not None and move > 5:
         st.warning("The stock needs a big move to break even. Think twice.")
+    m = o[(o["strike"] == strike) & (o["symbol"].str.endswith(side))]
+    if not m.empty:
+        paper_opt_ticket(sym, f"{sym} {strike:g} {side} {expiry}", str(m["token"].iloc[0]),
+                         lot, prem, stop_prem, target_prem)
     st.caption("Option buying can lose 100% of the premium. Decide your exit before entering.")
 
 
@@ -800,6 +826,326 @@ def pick_and_open(df, key):
         st.caption("After tapping, switch to the Analyse tab.")
 
 
+# ---------- Market cap filter ----------
+CAPS = ["All sizes", "Large cap", "Mid cap", "Small cap"]
+
+
+@st.cache_data(ttl=86400, show_spinner="Loading market caps (first time only, can take a minute)...")
+def get_mcaps(symbols):
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(sym):
+        try:
+            fi = yf.Ticker(sym + ".NS").fast_info
+            try:
+                mc = fi.market_cap
+            except Exception:
+                mc = fi["marketCap"]
+            return float(mc) if mc and mc > 0 else None
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        vals = list(ex.map(one, symbols))
+    return dict(zip(symbols, vals))
+
+
+def cap_class(sym, mc):
+    if isnum(mc) and mc > 0:
+        cr = mc / 1e7
+        return "Large cap" if cr >= 100000 else "Mid cap" if cr >= 30000 else "Small cap"
+    return "Large cap" if sym in NIFTY50 else None
+
+
+def apply_cap(tbl, choice):
+    if choice == CAPS[0] or tbl.empty:
+        return tbl
+    mcs = get_mcaps(tuple(tbl["Symbol"]))
+    t = tbl.copy()
+    t["Cap"] = [cap_class(x, mcs.get(x)) for x in t["Symbol"]]
+    if t["Cap"].notna().mean() < 0.3:
+        st.info("Market-cap data is not available right now, so all sizes are shown.")
+        return tbl
+    st.caption("Approximate sizes: Large = above ₹1 lakh crore, Mid = ₹30,000 crore to "
+               "₹1 lakh crore, Small = below ₹30,000 crore.")
+    return t[t["Cap"] == choice]
+
+
+# ---------- Paper trading ----------
+PAPER_FILE = "paper_trading.json"
+FUT_MARGIN = 0.20  # rough margin blocked for futures; the real margin varies
+
+
+def _now():
+    return pd.Timestamp.now(tz="Asia/Kolkata").strftime("%d %b %H:%M")
+
+
+def _gist_cfg():
+    try:
+        return st.secrets["GITHUB_TOKEN"], st.secrets["GIST_ID"]
+    except Exception:
+        return None
+
+
+def _gist_headers(token):
+    return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+
+
+def book_load():
+    if st.session_state.get("book_loaded"):
+        return st.session_state.get("book")
+    book = None
+    cfg = _gist_cfg()
+    if cfg:
+        try:
+            r = requests.get(f"https://api.github.com/gists/{cfg[1]}",
+                             headers=_gist_headers(cfg[0]), timeout=10)
+            r.raise_for_status()
+            f = r.json().get("files", {}).get(PAPER_FILE)
+            if f:
+                data = json.loads(f.get("content") or "{}")
+                if isinstance(data, dict) and data.get("start"):
+                    book = data
+        except Exception as e:
+            st.session_state["book_err"] = f"Could not load your saved account: {e}"
+            return None
+    st.session_state.pop("book_err", None)
+    st.session_state["book"] = book
+    st.session_state["book_loaded"] = True
+    return book
+
+
+def book_save(book):
+    st.session_state["book"] = book
+    st.session_state["book_loaded"] = True
+    cfg = _gist_cfg()
+    if not cfg:
+        return
+    try:
+        r = requests.patch(f"https://api.github.com/gists/{cfg[1]}",
+                           headers=_gist_headers(cfg[0]), timeout=10,
+                           json={"files": {PAPER_FILE: {"content": json.dumps(book or {})}}})
+        r.raise_for_status()
+        st.session_state.pop("book_save_err", None)
+    except Exception as e:
+        st.session_state["book_save_err"] = f"Could not save permanently: {e}"
+
+
+def _pnl(p, price):
+    return (price - p["entry"]) * p["qty"] * (1 if p["side"] == "LONG" else -1)
+
+
+def paper_open(kind, symbol, label, side, qty, entry, stop, target, token=None):
+    book = book_load()
+    if book is None:
+        return False, "Start your paper account first in the 📒 Paper tab."
+    qty = int(qty)
+    if qty < 1 or not isnum(entry) or entry <= 0:
+        return False, "Invalid quantity or price."
+    blocked = qty * entry * (FUT_MARGIN if kind == "future" else 1)
+    if blocked > book["cash"]:
+        return False, (f"Not enough virtual cash. Needed ₹{blocked:,.0f}, "
+                       f"available ₹{book['cash']:,.0f}.")
+    book["cash"] -= blocked
+    book["open"].append({"id": book["next_id"], "kind": kind, "symbol": symbol,
+                         "label": label, "side": side, "qty": qty,
+                         "entry": float(entry), "stop": float(stop),
+                         "target": float(target), "token": token,
+                         "blocked": float(blocked), "opened": _now()})
+    book["next_id"] += 1
+    book_save(book)
+    return True, f"Paper trade opened: {side} {qty} x {label} at ₹{entry:.2f}. See the 📒 Paper tab."
+
+
+def paper_close(pid, price, reason):
+    book = book_load()
+    pos = next((p for p in book["open"] if p["id"] == pid), None)
+    if pos is None:
+        return
+    pnl = _pnl(pos, price)
+    book["cash"] += pos["blocked"] + pnl
+    book["open"].remove(pos)
+    book["closed"].append({**pos, "exit": float(price), "pnl": round(float(pnl), 2),
+                           "reason": reason, "closed": _now()})
+    book_save(book)
+
+
+def live_prices(book):
+    prices = {}
+    for x in {p["symbol"] for p in book["open"] if p["kind"] == "stock"}:
+        h = get_hist(x + ".NS", "5d", "1d")
+        if not h.empty:
+            prices[("stock", x)] = float(h["Close"].iloc[-1])
+    toks = tuple(sorted({p["token"] for p in book["open"]
+                         if p["kind"] != "stock" and p.get("token")}))
+    if toks:
+        try:
+            q = get_quotes(toks)
+            for t in toks:
+                ltp = q.get(t, {}).get("ltp")
+                if isnum(ltp) and ltp > 0:
+                    prices[("fo", t)] = float(ltp)
+        except Exception:
+            st.session_state["fo_price_err"] = True
+    return prices
+
+
+def price_of(p, prices):
+    key = ("stock", p["symbol"]) if p["kind"] == "stock" else ("fo", p["token"])
+    return prices.get(key)
+
+
+def auto_exits(book, prices):
+    msgs = []
+    for p in list(book["open"]):
+        px = price_of(p, prices)
+        if px is None:
+            continue
+        lng = p["side"] == "LONG"
+        if (lng and px <= p["stop"]) or (not lng and px >= p["stop"]):
+            reason = "Stop-loss hit"
+        elif (lng and px >= p["target"]) or (not lng and px <= p["target"]):
+            reason = "Target hit"
+        else:
+            continue
+        paper_close(p["id"], px, reason)
+        msgs.append(f"{p['label']}: {reason} at ₹{px:.2f}")
+    return msgs
+
+
+def _ticket_result(ok, msg):
+    (st.success if ok else st.error)(msg)
+
+
+def paper_stock_ticket(sym, v, qty):
+    with st.expander("📒 Paper trade this"):
+        if v["verdict"] != "BUY":
+            st.caption("The verdict is not BUY. Practising against it is fine, "
+                       "just notice how it turns out.")
+        n = st.number_input("Shares (virtual)", min_value=1, value=max(int(qty), 1),
+                            step=1, key=f"pt_q_{sym}")
+        st.caption(f"Uses about ₹{n * v['entry']:,.0f} of virtual cash. "
+                   f"Stop ₹{v['stop']:.2f}, target ₹{v['target']:.2f}.")
+        if st.button("Buy in paper account", key=f"pt_b_{sym}"):
+            _ticket_result(*paper_open("stock", sym, f"{sym} shares", "LONG", n,
+                                       v["entry"], v["stop"], v["target"]))
+
+
+def paper_fut_ticket(sym, expiry, token, long_side, lot, entry, stop, target):
+    with st.expander("📒 Paper trade this"):
+        side = "LONG" if long_side else "SHORT"
+        lots = st.number_input("Lots (virtual)", min_value=1, value=1, step=1,
+                               key=f"pf_q_{sym}_{expiry}")
+        st.caption(f"{side} {lots * lot} units. Blocks about ₹{lots * lot * entry * FUT_MARGIN:,.0f} "
+                   f"as margin (rough {FUT_MARGIN * 100:.0f}% assumption). "
+                   f"Stop ₹{stop:.2f}, target ₹{target:.2f}.")
+        if st.button(f"{side.title()} in paper account", key=f"pf_b_{sym}_{expiry}"):
+            _ticket_result(*paper_open("future", sym, f"{sym} FUT {expiry}", side,
+                                       lots * lot, entry, stop, target, token))
+
+
+def paper_opt_ticket(sym, label, token, lot, prem, stop_prem, target_prem):
+    with st.expander("📒 Paper trade this"):
+        lots = st.number_input("Lots (virtual)", min_value=1, value=1, step=1,
+                               key=f"po_q_{label}")
+        st.caption(f"Buying {lots * lot} units. Costs ₹{lots * lot * prem:,.0f} "
+                   f"(this is also your maximum loss). Exit at ₹{stop_prem:.2f}, "
+                   f"target ₹{target_prem:.2f}.")
+        if st.button("Buy in paper account", key=f"po_b_{label}"):
+            _ticket_result(*paper_open("option", sym, label, "LONG", lots * lot,
+                                       prem, stop_prem, target_prem, token))
+
+
+def render_paper(book):
+    prices = live_prices(book)
+    for m in auto_exits(book, prices):
+        st.warning("Auto-closed: " + m)
+    if st.session_state.get("book_save_err"):
+        st.warning(st.session_state["book_save_err"])
+    if st.session_state.get("fo_price_err"):
+        st.caption("Could not get live F&O prices right now.")
+
+    rows, held = [], 0.0
+    for p in book["open"]:
+        px = price_of(p, prices)
+        pnl = _pnl(p, px) if px is not None else None
+        held += p["blocked"] + (pnl or 0)
+        rows.append({"ID": p["id"], "Trade": p["label"], "Side": p["side"], "Qty": p["qty"],
+                     "Entry": round(p["entry"], 2),
+                     "Now": round(px, 2) if px is not None else None,
+                     "P&L ₹": round(pnl) if pnl is not None else None,
+                     "Stop": round(p["stop"], 2), "Target": round(p["target"], 2),
+                     "Opened": p["opened"]})
+    equity = book["cash"] + held
+    total = equity - book["start"]
+    closed = book["closed"]
+    wins = sum(1 for c in closed if c["pnl"] > 0)
+
+    st.subheader("Your paper account")
+    st.write(f"Total value: **₹{equity:,.0f}**  ({total:+,.0f}, {total / book['start'] * 100:+.1f}%)")
+    st.write(f"Virtual cash: **₹{book['cash']:,.0f}** | In open trades: **₹{held:,.0f}** | "
+             f"Started with: ₹{book['start']:,.0f}")
+    st.write(f"Closed trades: **{len(closed)}**"
+             + (f" | Won: **{wins}** ({wins / len(closed) * 100:.0f}%)" if closed else "")
+             + f" | Realised P&L: **₹{sum(c['pnl'] for c in closed):+,.0f}**")
+
+    st.subheader("Open trades")
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True)
+        names = {r["ID"]: r["Trade"] for r in rows}
+        cid = st.selectbox("Close a trade", list(names), index=None,
+                           placeholder="Choose a trade", format_func=lambda i: names[i])
+        if cid is not None and st.button("Close at current price"):
+            pos = next(p for p in book["open"] if p["id"] == cid)
+            px = price_of(pos, prices)
+            if px is None:
+                st.error("Current price is not available right now. Try again in a minute.")
+            else:
+                paper_close(cid, px, "Closed by you")
+                st.rerun()
+        st.caption("Stop-loss and target are checked whenever you open the app, at the price "
+                   "then (it can be worse than your stop if the stock gaps). Brokerage and "
+                   "taxes are not included.")
+    else:
+        st.info("No open trades. Open a stock, futures or options idea in the Analyse tab "
+                "and tap '📒 Paper trade this'.")
+
+    if closed:
+        with st.expander("Trade history"):
+            hist = pd.DataFrame(closed[::-1])[["label", "side", "qty", "entry", "exit",
+                                               "pnl", "reason", "closed"]]
+            hist.columns = ["Trade", "Side", "Qty", "Entry", "Exit", "P&L ₹", "Why closed", "Closed"]
+            st.dataframe(hist, hide_index=True)
+
+    with st.expander("Backup, restore and reset"):
+        if _gist_cfg():
+            st.success("Saved permanently (private Gist).")
+        else:
+            st.warning("Not saved permanently. If you refresh or close the page, the account "
+                       "is lost. Download a backup below, or ask to set up permanent saving.")
+        st.download_button("Download backup", json.dumps(book), "paper_backup.json",
+                           "application/json")
+        restore_ui()
+        if st.checkbox("I understand: delete my paper account and start again"):
+            if st.button("Reset paper account"):
+                book_save(None)
+                st.rerun()
+
+
+def restore_ui():
+    up = st.file_uploader("Restore from a backup file", type=["json"])
+    if up is not None and st.button("Restore this backup"):
+        try:
+            data = json.loads(up.getvalue().decode("utf-8"))
+            assert data.get("start") and "open" in data and "closed" in data
+            book_save(data)
+            st.rerun()
+        except AssertionError:
+            st.error("This file does not look like a valid backup.")
+        except Exception:
+            st.error("Could not read this file.")
+
+
 # ---------- Run ----------
 with tab_a:
     if go:
@@ -825,22 +1171,27 @@ with tab_a:
 with tab_m:
     st.caption("Biggest movers of the day. Prices come from Yahoo and can be slightly delayed.")
     uni_m = st.radio("Stocks to scan", UNIVERSES, horizontal=True, key="uni_m")
+    cap_m = st.radio("Company size", CAPS, horizontal=True, key="cap_m")
     if st.button("Show top gainers and losers"):
         st.session_state["movers"] = True
     if st.session_state.get("movers"):
         try:
-            tbl = scan_universe(universe_symbols(uni_m))
-            if tbl.empty:
+            full = scan_universe(universe_symbols(uni_m))
+            if full.empty:
                 st.warning("Could not load prices right now. Try again in a minute.")
             else:
-                tbl = tbl.sort_values("Chg %", ascending=False)
-                st.subheader("🟢 Top gainers")
-                st.dataframe(tbl.head(10), hide_index=True)
-                st.subheader("🔴 Top losers")
-                st.dataframe(tbl.tail(10).iloc[::-1], hide_index=True)
-                st.caption("A stock that jumped a lot today is not automatically a buy. "
-                           "Open it in Analyse and check the verdict and risk-reward first.")
-                pick_and_open(pd.concat([tbl.head(10), tbl.tail(10)]), "pick_m")
+                tbl = apply_cap(full, cap_m)
+                if tbl.empty:
+                    st.info("No stocks of this size in this list.")
+                else:
+                    tbl = tbl.sort_values("Chg %", ascending=False)
+                    st.subheader("🟢 Top gainers")
+                    st.dataframe(tbl.head(10), hide_index=True)
+                    st.subheader("🔴 Top losers")
+                    st.dataframe(tbl.tail(10).iloc[::-1], hide_index=True)
+                    st.caption("A stock that jumped a lot today is not automatically a buy. "
+                               "Open it in Analyse and check the verdict and risk-reward first.")
+                    pick_and_open(pd.concat([tbl.head(10), tbl.tail(10)]), "pick_m")
         except Exception as e:
             st.error("Could not load market data.")
             st.caption(f"Details: {e}")
@@ -850,14 +1201,16 @@ with tab_i:
     st.caption("Quick scan of many stocks using technicals and risk-reward only. "
                "Fundamentals are checked when you open a stock in Analyse.")
     uni_i = st.radio("Stocks to scan", UNIVERSES, horizontal=True, key="uni_i")
+    cap_i = st.radio("Company size", CAPS, horizontal=True, key="cap_i")
     if st.button("Scan for setups"):
         st.session_state["scan"] = True
     if st.session_state.get("scan"):
         try:
-            tbl = scan_universe(universe_symbols(uni_i))
-            if tbl.empty:
+            full = scan_universe(universe_symbols(uni_i))
+            if full.empty:
                 st.warning("Could not load prices right now. Try again in a minute.")
             else:
+                tbl = apply_cap(full, cap_i)
                 buys = tbl[tbl["Verdict"] == "BUY"].sort_values("Score", ascending=False)
                 waits = tbl[tbl["Verdict"] == "WAIT"].sort_values("Score", ascending=False)
                 if buys.empty:
@@ -886,3 +1239,25 @@ with tab_i:
         except Exception as e:
             st.error("Could not load this sector.")
             st.caption(f"Details: {e}")
+
+with tab_p:
+    cfg = _gist_cfg()
+    book = book_load()
+    if st.session_state.get("book_err") and cfg:
+        st.error(st.session_state["book_err"])
+        st.caption("Your saved account is untouched. Reload the page to try again.")
+    elif book is None:
+        st.subheader("Start paper trading")
+        st.write("Practise with virtual money. No real orders are ever placed.")
+        start = st.number_input("Virtual money to start with (₹)", min_value=10000,
+                                max_value=10000000, value=100000, step=10000, key="paper_start")
+        if st.button("Start paper account"):
+            book_save({"start": float(start), "cash": float(start), "open": [],
+                       "closed": [], "next_id": 1, "created": _now()})
+            st.rerun()
+        with st.expander("Restore a backup instead"):
+            restore_ui()
+        if not cfg:
+            st.caption("Note: without permanent saving, the account is lost when you refresh the page.")
+    else:
+        render_paper(book)
